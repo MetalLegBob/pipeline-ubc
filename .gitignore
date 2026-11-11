@@ -1,0 +1,10 @@
+target/
+**/target/
+.DS_Store
+*.so
+test-ledger/
+
+# Solana keypairs are never committed.
+*keypair*.json
+id.json
+**/keys/

@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cache/solana
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: No keypairs in the repository
+        run: scripts/check-no-keypairs.sh
+      - name: Install cargo-build-sbf (sBPF v3 toolchain)
+        run: |
+          if ! cargo build-sbf --version 2>/dev/null | grep -q "4.6.0"; then
+            cargo install cargo-build-sbf --version 4.6.0 --locked --force
+          fi
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Build the program
+        run: cargo build-sbf --manifest-path programs/bonding-curve/Cargo.toml
+      - name: Lint the pricing maths
+        run: cargo clippy -p pipeline-curve-math --all-targets -- -D warnings
+      - name: Test the pricing maths
+        run: cargo test -p pipeline-curve-math

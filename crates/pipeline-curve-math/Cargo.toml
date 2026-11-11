@@ -1,0 +1,13 @@
+[package]
+name = "pipeline-curve-math"
+version = "0.1.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+description = "Pricing maths for Pipeline's bonding curve, shared by the on-chain program and clients"
+repository = "https://github.com/MetalLegBob/pipeline-ubc"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"

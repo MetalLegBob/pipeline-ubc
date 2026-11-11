@@ -1,0 +1,14 @@
+# The bonding curve program and its pricing maths. Build the program on its own:
+#   cargo build-sbf --manifest-path programs/bonding-curve/Cargo.toml
+[workspace]
+resolver = "2"
+members = ["programs/bonding-curve", "crates/pipeline-curve-math"]
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[workspace.metadata.solana]
+# Platform tools used by cargo-build-sbf (sBPF v3 output).
+tools-version = "v1.58"
