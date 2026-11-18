@@ -155,6 +155,24 @@ pub fn solve_split(
     })
 }
 
+/// The smallest exact virtual quote, `P·T / (S − P)`, a launch may have.
+///
+/// [`solve_split`] rounds `V` up and `virtual_tokens − S` down, and the completing buy
+/// absorbs the difference: whoever completes the curve receives about `1 / V` of the raise
+/// in extra tokens. At 1,000 raw units that is at most about 0.1%. Any SOL or 6-decimal
+/// quote launch with a sensible threshold has `V` in the millions or more.
+pub const MIN_VIRTUAL_QUOTE: u64 = 1_000;
+
+impl Shape {
+    /// Whether the exact (unrounded) virtual quote `P·T / (S − P)` is at least
+    /// [`MIN_VIRTUAL_QUOTE`], for a curve that graduates after raising `threshold`.
+    pub fn has_enough_virtual_quote(&self, threshold: u64) -> bool {
+        let gap = (self.curve_tokens - self.graduation_tokens) as u128;
+        // P < 2^64 and T < 2^64, so P·T fits in 128 bits; so does 1,000·(S − P).
+        self.graduation_tokens as u128 * threshold as u128 >= MIN_VIRTUAL_QUOTE as u128 * gap
+    }
+}
+
 /// The size of each probe trade in the post-seed price check: 0.1% of what was seeded,
 /// and at least one unit.
 pub fn probe_amount(seeded: u64) -> u64 {
@@ -469,6 +487,17 @@ mod tests {
             sold: 0,
             raised: 0,
         }
+    }
+
+    #[test]
+    fn the_minimum_virtual_quote_is_exact() {
+        // S = 9e8, P = 1e8: P·T = 1,000·(S − P) at T = 8,000.
+        let at = solve_split(1_000_000_000, 9_000, 1_000, 0, 8_000).unwrap();
+        assert!(at.has_enough_virtual_quote(8_000));
+        let below = solve_split(1_000_000_000, 9_000, 1_000, 0, 7_999).unwrap();
+        assert!(!below.has_enough_virtual_quote(7_999));
+        let default = solve_split(1_000_000_000_000_000, 7_931, 2_069, 0, 85 * SOL).unwrap();
+        assert!(default.has_enough_virtual_quote(85 * SOL));
     }
 
     #[test]

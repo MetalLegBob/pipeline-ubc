@@ -27,7 +27,7 @@ Rust and TypeScript client helpers (launch and graduation builders, account deco
 
 ## Launching
 
-A launch is one call to the router's `create_market` with the curve as the strategy and the curve's `InitParams` (Borsh) as setup data. Then call the router's `init_fee_account` for both mints, in a second transaction (a new-token launch fills a transaction by itself: about 1,130 of 1,232 bytes).
+A launch is one call to the router's `create_market` with the curve as the strategy and the curve's `InitParams` (Borsh) as setup data. Then call the router's `init_fee_account` for both mints, in a second transaction (a new-token launch nearly fills a transaction by itself: about 1,100 of 1,232 bytes).
 
 Two kinds of launch:
 
@@ -53,13 +53,13 @@ Two kinds of launch:
 | `trading_delay_slots` | u64 | 0 | Delays the first trade |
 | `target_program` | Pubkey | the example pool | Where it graduates: a registered Pipeline strategy that implements `pipeline_seed_liquidity` |
 | `target_seed_data` | bytes | 2-byte fee | The target's `pipeline_seed_liquidity` data, at most 256 bytes |
-| `fallback_program` | Option\<Pubkey\> | `None` (the example pool) | Used if graduation into the target hasn't happened 3 days after completion |
+| `fallback_program` | Option\<Pubkey\> | `None` (the example pool) | Used if graduation into the target hasn't happened 3 days after completion. A custom fallback must be a deployed program registered with Pipeline, checked at launch (`FallbackNotUsable`) |
 | `fallback_seed_data` | bytes | 0.3% fee | The fallback's seed data. For the example pool it must be a valid 2-byte fee, checked at launch |
 | `lp_policy` | `LpPolicy` | `Locked` | What happens to LP the target issues: `Locked` (held by `["lp", curve]`, which nothing can move), `Burn`, or `Creator(wallet)` |
 | `graduation_reward` | u64 | 0 | Paid in the quote token to whoever runs `graduate`. A keeper tip: at most 1% of the threshold |
-| `price_tolerance_bps` | u16 | 100 | How far the graduated pool's mid price may be from the price the curve offered it. 10,000 turns the check off |
+| `price_tolerance_bps` | u16 | 100 | How far the graduated pool's mid price may be from the price the curve offered it: 1 to 10,000 (0 is refused). 10,000 turns the check off. Graduating into the default fallback skips the check |
 
-**Setup accounts** (the strategy accounts of `create_market`, after the router's four fixed accounts): token mint (a fresh keypair signing, for a new token), quote mint, the curve's token vault and quote vault (its associated token accounts), the token program, the quote token program, and the associated token program.
+**Setup accounts** (the strategy accounts of `create_market`, after the router's four fixed accounts): token mint (a fresh keypair signing, for a new token), quote mint, the curve's token vault and quote vault (its associated token accounts), the token program, the quote token program, and the associated token program. With a custom fallback, two more: the fallback program and its Pipeline registration (`["strategy", fallback]` under the router).
 
 ### The split
 
@@ -71,7 +71,7 @@ The curve is constant product over virtual reserves. The program derives it from
 
 Both roundings favour the curve, so the final price is never below `T / P` and the pool never opens below it. With the defaults this gives pump.fun's familiar numbers: 793.1M tokens sold, 206.9M seeded, a starting market cap of about 28 SOL.
 
-A launch is refused with `BadSplit` when the shares add up to more than 100%, when the pool would get as many tokens as are sold or more (a constant-product curve can't hand off continuously to such a pool), when the pool share or threshold rounds to nothing, when the virtual reserves don't fit in 64 bits, or when a completed curve couldn't graduate. Example: selling 45%, seeding 30% and allocating 25% to the team works; selling 30% and seeding 40% doesn't.
+A launch is refused with `BadSplit` when the shares add up to more than 100%, when the pool would get as many tokens as are sold or more (a constant-product curve can't hand off continuously to such a pool), when the pool share or threshold rounds to nothing, when the virtual reserves don't fit in 64 bits, when the virtual quote would be below 1,000 units (such thin shapes hand the completing buyer an outsized share of the raise), or when a completed curve couldn't graduate. Example: selling 45%, seeding 30% and allocating 25% to the team works; selling 30% and seeding 40% doesn't.
 
 ## Trading
 
@@ -91,22 +91,25 @@ The curve is an ordinary Pipeline market with two mints: the token (index 0) and
 4. lends the target up to `max_rent_lamports` of the caller's SOL through `["rent", curve]`;
 5. calls the target's `pipeline_seed_liquidity`, offering the pool's tokens and the reserve's together (the target's own seed data says how many are for its reserve);
 6. checks the target created the market state, took from both escrows and left the rent payer a plain system account;
-7. **checks the new pool's price** (below);
-8. returns anything left in the escrows, pays the reward, burns leftover tokens (new tokens) or records them as owed (existing tokens), and returns the unspent rent SOL.
+7. **binds the new market to the target's own description of it:** it calls the target's `pipeline_market_info` on the new market and requires the seed to have arrived in the vaults the target declares (`SeedNotDelivered`), and the price check to read those same vaults (`WrongQuoteVault`);
+8. **checks the new pool's price** (below), unless it is graduating into the default fallback;
+9. returns anything left in the escrows, pays the reward, burns leftover tokens (new tokens) or records them as owed (existing tokens), and returns the unspent rent SOL.
 
 Then record the new market with the router's `register_existing_market`, and `init_fee_account` for both mints. Anyone can do this, in the same transaction or later; for the example pool all four instructions fit in one legacy transaction.
 
-**Accounts:** caller (signer), curve, token mint, quote mint, token vault, quote vault, token program, quote token program, seed authority `["seed", curve]`, token escrow and quote escrow (the seed authority's associated token accounts), rent payer `["rent", curve]`, LP recipient, reward account (the caller's quote token account), target program, the target's Pipeline registration (`["strategy", target]` under the router), the new market state, the associated token program and the system program. After those: the target's own seed accounts (ending with `hook_accounts` transfer-hook accounts), then `buy_quote_accounts` and `sell_quote_accounts` accounts for the price check.
+**Accounts:** caller (signer), curve, token mint, quote mint, token vault, quote vault, token program, quote token program, seed authority `["seed", curve]`, token escrow and quote escrow (the seed authority's associated token accounts), rent payer `["rent", curve]`, LP recipient, reward account (the caller's quote token account), target program, the target's Pipeline registration (`["strategy", target]` under the router), the new market state, the associated token program and the system program. After those: the target's own seed accounts, which must include the new market's vaults (ending with `hook_accounts` transfer-hook accounts), then `buy_quote_accounts` and `sell_quote_accounts` accounts for the price check (none when graduating into the default fallback).
 
 ### The price check
 
 After seeding, `graduate` asks the new pool for a small buy and a small sell through its own `pipeline_quote` (0.1% of what was seeded, at least one unit each). Their geometric mean is the pool's mid price, which cancels a symmetric pool fee. It must be within `price_tolerance_bps` of the price the curve offered, which is the seeded quote ÷ the seeded pool tokens (the reserve share doesn't count). Otherwise the whole graduation reverts with `PoolOffPrice`. The comparison is exact integer maths.
 
-It catches a target that opens off-price, takes less of one side than it was offered, prices buys and sells unevenly, or pours a reserve share into its pool. It can't catch a target whose quotes lie about its pool. A tolerance of 10,000 skips it, so a target without a working quote can still be graduated into: the creator's choice.
+It proves that the new market quotes the offered price, within the tolerance, for two small trades. It catches a target that opens off-price, takes less of one side than it was offered, prices buys and sells unevenly, or moves the price by pooling a reserve share by more than the tolerance. It doesn't prove the pool's depth, and it can't catch a target whose quotes misreport its pool. A tolerance of 10,000 skips it, so a target without a working quote can still be graduated into: the creator's choice.
+
+**The default fallback always works.** Graduating into the default fallback (Pipeline's audited example pool) skips the price check, so a launch that keeps the default fallback can always graduate: at worst, after 3 days, into the example pool. Small pools whose probe trades round to nothing, and quote tokens whose transfer fee rises above the tolerance, can make a custom target fail the check, but never lock the raise.
 
 The quote accounts for each probe are the fixed trade accounts (the new market's router market signer, market state, mints and token programs; the trader accounts may be placeholders) followed by whatever the target's `pipeline_resolve_accounts` lists for that trade. For the example pool that is just the output vault.
 
-**What a target can and can't do:** it only ever receives the escrows and the bounded rent SOL. It never touches the curve's own vaults, so creator fees and the unclaimed allocation are out of reach. Choosing the target is the creator's decision.
+**What a target can and can't do:** it only ever receives the escrows and the bounded rent SOL, and the seed must land in the vaults it declares for the new market. It never touches the curve's own vaults, so creator fees and the unclaimed allocation are out of reach. Choosing the target is the creator's decision.
 
 ## Custom actions
 
@@ -123,7 +126,7 @@ Fee-free, called directly on the curve program.
 
 ## Make your AMM a graduation target
 
-Implement Pipeline's optional `pipeline_seed_liquidity` entry point (see the [strategy guide](https://github.com/MetalLegBob/pipeline/blob/main/docs/STRATEGY-GUIDE.md#9-optional-accepting-graduations)). Every launch can then graduate into your AMM. Derive the new market's address from the seeder, take at most the offered amounts, open at the price they imply, and make sure your `pipeline_quote` works on the new market so the price check passes. Pipeline's example constant-product strategy is the reference implementation (about 60 lines).
+Implement Pipeline's optional `pipeline_seed_liquidity` entry point (see the [strategy guide](https://github.com/MetalLegBob/pipeline/blob/main/docs/STRATEGY-GUIDE.md#9-optional-accepting-graduations)). Every launch can then graduate into your AMM. Derive the new market's address from the seeder, take at most the offered amounts, open at the price they imply, and make sure your `pipeline_quote` and `pipeline_market_info` work on the new market so graduation's checks pass. **Validate every account you write to or price from** (vaults, LP accounts, resolved accounts) against your market state and mints: everything after the per-mint accounts is chosen by whoever calls `graduate`, not by the launch creator. Create the new market state with transfer + allocate + assign (as Anchor's `init` does) rather than a plain `CreateAccount`, so a rent-exempt pre-fund of its address can't block it. During graduation the curve calls your `pipeline_quote` with every account read-only, no trader, empty `extra`, exact-in, and the mints in seeded order (the token first). Pipeline's example constant-product strategy is the reference implementation (about 60 lines).
 
 ## Costs and limits
 
@@ -131,8 +134,8 @@ Implement Pipeline's optional `pipeline_seed_liquidity` entry point (see the [st
 |---|---|
 | Launch a new token, with fee accounts | about 181,000 |
 | Buy through the router, with SOL wrapping and account creation | about 86,000–90,000 |
-| Graduate into the example pool, with the price check | about 184,000 (161,000 with the check off) |
-| Graduate, register and add both fee accounts in one transaction | about 250,000 |
+| Graduate into the example pool, with the price check | about 189,000 (166,000 with the check off) |
+| Graduate, register and add both fee accounts in one transaction | about 265,000 |
 
 Set the compute limit explicitly: graduation can exceed the default of 200,000 per instruction. During graduation the call depth is curve → target → token program → transfer hook, which fits but leaves no room if the target calls further programs with hooked tokens. Large target seed data (around 100 bytes or more) with long token metadata can push a launch over the transaction size limit; then use a v0 transaction with an address lookup table.
 
@@ -144,10 +147,14 @@ Set the compute limit explicitly: graduation can exceed the default of 200,000 p
 - **A published vanity mint can be blocked** by sending SOL to its address first; the creator then uses another mint keypair.
 - **Existing-token curves have no refund path.** Tokens sent to a curve that never reaches its full supply stay there.
 - **A graduation target can keep the caller's rent SOL** (up to `max_rent_lamports`). Keepers should simulate first and keep it small.
+- **The reserve share needs a reserve-aware target graduated within 3 days.** Otherwise the default fallback takes the graduation without it, and it is burned (new tokens) or owed to the leftover recipient (existing tokens).
+- **A custom fallback is the creator's risk.** If it rejects its seed data, or its upgrade authority replaces it after launch, a curve whose target also fails can't graduate.
+- **A quote token's issuer powers reach every curve quoted in it.** A permanent delegate, freeze or pause authority on the quote token can drain or halt those curves. Choose quote tokens accordingly; Pipeline's SDK and API show these powers as flags.
+- **Rounding dust** from the split is at most 3 units; it joins the pool's tokens.
 
 ## Reviews
 
-Version 1 of the curve went through three internal review rounds and a Stronghold of Security audit. Every finding is fixed and covered by a regression test: transfer-fee tokens at graduation, launch-address takeover, fallback data, launch-fee timing, pre-funded pools, allocation timing, overflow edge cases, a leftover recipient blocking graduation, dust trades, launches that could complete but never graduate, and a 64-bit truncation in the graduation amounts. Randomised invariant runs check that the quote vault always reconciles, supply reconciles at graduation, no trader or group of traders gets back more than they paid, exact-out agrees with exact-in, and the graduated pool never opens below the curve's final price. These tests run against the real Pipeline router in Pipeline's own test suite; the pricing maths' property tests are in this repository. Version 1.1's additions (the creator-chosen split, the price check and the reserve share) are covered by tests, including property tests of the split, but haven't been through a review round yet. There has been no external audit.
+Version 1 of the curve went through three internal review rounds and a Stronghold of Security audit. Every finding is fixed and covered by a regression test: transfer-fee tokens at graduation, launch-address takeover, fallback data, launch-fee timing, pre-funded pools, allocation timing, overflow edge cases, a leftover recipient blocking graduation, dust trades, launches that could complete but never graduate, and a 64-bit truncation in the graduation amounts. Randomised invariant runs check that the quote vault always reconciles, supply reconciles at graduation, no trader or group of traders gets back more than they paid, exact-out agrees with exact-in, and the graduated pool never opens below the curve's final price. These tests run against the real Pipeline router in Pipeline's own test suite; the pricing maths' property tests are in this repository. Version 1.1 (the creator-chosen split, the price check and the reserve share) then had its own curve-only Stronghold of Security audit: no critical or high findings, three medium and seven low. All are fixed or documented; see [`AUDIT.md`](AUDIT.md). There has been no external audit.
 
 ## Build and test
 
