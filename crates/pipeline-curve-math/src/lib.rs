@@ -363,7 +363,9 @@ impl Curve {
         } else {
             let (vq, vt) = self.virtual_reserves();
             let needed = (vq * tokens as u128).div_ceil(vt - tokens as u128);
-            u64::try_from(needed).ok()?.min(remaining)
+            // Capped before narrowing: a formula quote above u64::MAX is still capped at
+            // the remaining raise (which fits), completing the curve.
+            needed.min(remaining as u128) as u64
         };
         let gross = gross_for_net(net, fee_bps)?;
         Some(self.buy_fill(gross, net, tokens))

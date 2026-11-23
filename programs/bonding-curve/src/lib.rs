@@ -31,8 +31,8 @@ use anchor_spl::associated_token::{self, AssociatedToken};
 use anchor_spl::token_2022::spl_token_2022::{
     self,
     extension::{
-        transfer_fee::TransferFeeConfig, BaseStateWithExtensions, ExtensionType,
-        StateWithExtensions,
+        transfer_fee::{TransferFeeAmount, TransferFeeConfig},
+        BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::AuthorityType,
 };
@@ -790,10 +790,12 @@ pub mod bonding_curve {
             )?;
         }
 
-        // What the target's own accounts hold before seeding, so the new market's vaults
-        // can be checked for what they received.
+        // What the target's own accounts hold before seeding, and the transfer fees they
+        // have withheld, so the new market's vaults can be checked for what they received.
         let seed_balances_before: Vec<u64> =
             seed_accounts.iter().map(token_balance_or_zero).collect();
+        let seed_withheld_before: Vec<u64> =
+            seed_accounts.iter().map(withheld_fees_or_zero).collect();
 
         // Call the target's `pipeline_seed_liquidity`.
         let mut metas = vec![
@@ -869,13 +871,17 @@ pub mod bonding_curve {
 
         // The accounts after the per-mint ones are the caller's choice, not the creator's.
         // Bind the seed to the market: the vaults the target itself declares for the new
-        // market must have received everything it took, so a caller can't have a target
-        // that fills whichever accounts it is given send the seed elsewhere.
-        let new_vaults = NewVaults {
+        // market must be owned by a program address and have received the pool's part of
+        // what it took, so a caller can't have a target that fills whichever accounts it
+        // is given send the pool elsewhere. Only the pool's tokens are bound: a
+        // reserve-aware target may keep the reserve share wherever its design does, and
+        // that account is the target's to check.
+        let new_sides = NewVaults {
             target: &accounts.target_program,
             market_state: &accounts.new_market_state,
             seed_accounts,
             balances_before: &seed_balances_before,
+            withheld_before: &seed_withheld_before,
             excluded: [
                 curve.token_vault,
                 curve.quote_vault,
@@ -885,7 +891,11 @@ pub mod bonding_curve {
         }
         .check(
             [
-                (&accounts.token_mint, curve.token_program, token_taken),
+                (
+                    &accounts.token_mint,
+                    curve.token_program,
+                    token_taken.min(seeded[0]),
+                ),
                 (&accounts.quote_mint, curve.quote_program, quote_taken),
             ],
             clock.epoch,
@@ -914,7 +924,7 @@ pub mod bonding_curve {
                 quote_mint: curve.quote_mint,
                 token_program: curve.token_program,
                 quote_program: curve.quote_program,
-                vaults: new_vaults,
+                sides: new_sides,
             };
             let buy = new_market.quote(buy_accounts, true, math::probe_amount(seeded[1]))?;
             let sell = new_market.quote(sell_accounts, false, math::probe_amount(seeded[0]))?;
@@ -1396,20 +1406,22 @@ struct NewMarket<'a, 'info> {
     quote_mint: Pubkey,
     token_program: Pubkey,
     quote_program: Pubkey,
-    /// The market's token and quote vaults, as its `pipeline_market_info` declares them.
-    vaults: [Pubkey; 2],
+    /// The market's token and quote, as its `pipeline_market_info` declares them.
+    sides: [MarketSide; 2],
 }
 
 impl<'info> NewMarket<'_, 'info> {
     /// The target's `pipeline_quote` for an exact-in trade of `amount`: a buy (quote in,
-    /// token out) or a sell. The new market's mints are in the order they were seeded:
-    /// the token, then the quote token.
+    /// token out) or a sell, with the mint indices the market's own info declares.
     ///
     /// `accounts` are the fixed trade accounts and then the target's own. The fixed ones
     /// that identify the trade must be this market's, including the input vault, which
     /// must be the one the market declares for the input mint (as the router requires in
-    /// a swap); the trader accounts are placeholders. All are passed read-only, as quotes
-    /// don't write.
+    /// a swap); the trader accounts are placeholders. No other token account of the
+    /// token or the quote mint may appear anywhere in the list (trader slots, resolved
+    /// accounts): the keeper chooses them, and a quote that prices from an unchecked
+    /// account's balance would otherwise let it pass an off-price pool. All are passed
+    /// read-only, as quotes don't write.
     fn quote(
         &self,
         accounts: &[AccountInfo<'info>],
@@ -1418,10 +1430,11 @@ impl<'info> NewMarket<'_, 'info> {
     ) -> Result<psi::QuoteResult> {
         use psi::trade_accounts as ix;
         require!(accounts.len() >= ix::LEN, CurveError::WrongAccount);
-        let (input_index, output_index) = if buying {
-            (QUOTE_INDEX, TOKEN_INDEX)
+        let [token, quote] = self.sides;
+        let (input, output) = if buying {
+            (quote, token)
         } else {
-            (TOKEN_INDEX, QUOTE_INDEX)
+            (token, quote)
         };
         let (input_mint, output_mint, input_program, output_program) = if buying {
             (
@@ -1448,17 +1461,25 @@ impl<'info> NewMarket<'_, 'info> {
         ] {
             require_keys_eq!(accounts[index].key(), expected, CurveError::WrongAccount);
         }
-        let [token_vault, quote_vault] = self.vaults;
-        let input_vault = if buying { quote_vault } else { token_vault };
         require_keys_eq!(
             accounts[ix::INPUT_VAULT].key(),
-            input_vault,
+            input.vault,
             CurveError::WrongQuoteVault
         );
+        for account in accounts {
+            let Some(mint) = token_account_mint(account) else {
+                continue;
+            };
+            for (curve_mint, side) in [(self.token_mint, token), (self.quote_mint, quote)] {
+                if mint == curve_mint {
+                    require_keys_eq!(account.key(), side.vault, CurveError::WrongQuoteVault);
+                }
+            }
+        }
         let request = psi::TradeRequest {
             mode: TradeMode::ExactIn,
-            input_index,
-            output_index,
+            input_index: input.index,
+            output_index: output.index,
             amount,
             trader: None,
             extra: vec![],
@@ -1486,6 +1507,14 @@ impl<'info> NewMarket<'_, 'info> {
     }
 }
 
+/// Where one of the curve's mints sits in the new market: its index in the market's mints
+/// and the vault the market declares for it.
+#[derive(Clone, Copy)]
+struct MarketSide {
+    index: u8,
+    vault: Pubkey,
+}
+
 /// The new market's vaults, bound to the seed after `pipeline_seed_liquidity`.
 struct NewVaults<'a, 'info> {
     target: &'a AccountInfo<'info>,
@@ -1494,25 +1523,36 @@ struct NewVaults<'a, 'info> {
     seed_accounts: &'a [AccountInfo<'info>],
     /// Their token balances just before seeding.
     balances_before: &'a [u64],
+    /// The Token-2022 transfer fees they held withheld just before seeding.
+    withheld_before: &'a [u64],
     /// The curve's vaults and the escrows, which are never the new market's.
     excluded: [Pubkey; 4],
 }
 
 impl<'info> NewVaults<'_, 'info> {
     /// Calls the target's read-only `pipeline_market_info` on the new market and returns
-    /// the vaults it declares for the token and the quote mint, which must be its first two
-    /// mints, in seeding order. `sides` are each mint, its token program and what the target
-    /// took from its escrow.
+    /// where it lists the token and the quote mint, and the vaults it declares for them.
+    /// The market may list its mints in any order and may have others besides, and may
+    /// declare a fee mint. `sides` are each mint, its token program and how much of what
+    /// the target took from its escrow must reach the vault.
     ///
-    /// Each vault must be one of the target's seed accounts (the only accounts it could
-    /// have filled), a token account of that mint, and must have received at least what
-    /// the target took, less the mint's transfer fee on one transfer. A target that lies in
-    /// its market info is a hostile target, which the creator chose.
+    /// Each vault must be:
+    /// - one of the target's seed accounts (the only accounts it could have filled);
+    /// - a token account of that mint;
+    /// - owned (as a token account) by a program address, not a wallet: an honest market
+    ///   holds its vaults under its own PDA, while a target that adopts whatever accounts
+    ///   the caller names would declare the caller's own;
+    /// - credited with at least the required amount, counting the transfer fees withheld
+    ///   in it during seeding, in any number of transfers. The fees counted are at most
+    ///   the mint's uncapped rate on the required amount (plus one unit of rounding for a
+    ///   second transfer), so they never excuse more than was actually charged.
+    ///
+    /// A target that lies in its market info is a hostile target, which the creator chose.
     fn check(
         &self,
         sides: [(&AccountInfo<'info>, Pubkey, u64); 2],
         epoch: u64,
-    ) -> Result<[Pubkey; 2]> {
+    ) -> Result<[MarketSide; 2]> {
         // Clear the seed result, so market info that sets no return data can't be read
         // as some.
         set_return_data(&[]);
@@ -1526,20 +1566,27 @@ impl<'info> NewVaults<'_, 'info> {
         )?;
         let (program, data) = get_return_data().ok_or(CurveError::BadMarketInfo)?;
         require_keys_eq!(program, self.target.key(), CurveError::BadMarketInfo);
-        let info = psi::MarketInfo::try_from_slice(&data)
-            .map_err(|_| error!(CurveError::BadMarketInfo))?;
+        // Decoded as the router does: a bare `MarketInfo`, or one followed by the
+        // market's fee mint.
+        let (info, _fee_mint) = psi::decode_market_info(&data).ok_or(CurveError::BadMarketInfo)?;
         require!(
-            info.mints.len() >= 2 && info.vaults.len() == info.mints.len(),
+            info.mints.len() >= 2
+                && info.mints.len() <= psi::MAX_MARKET_MINTS
+                && info.vaults.len() == info.mints.len(),
             CurveError::BadMarketInfo
         );
 
-        let mut vaults = [Pubkey::default(); 2];
-        for (i, (mint, token_program, taken)) in sides.into_iter().enumerate() {
-            require!(
-                info.mints[i] == mint.key.to_bytes(),
-                CurveError::BadMarketInfo
-            );
-            let vault = Pubkey::new_from_array(info.vaults[i]);
+        let mut found = [MarketSide {
+            index: 0,
+            vault: Pubkey::default(),
+        }; 2];
+        for (i, (mint, token_program, required)) in sides.into_iter().enumerate() {
+            let index = info
+                .mints
+                .iter()
+                .position(|listed| *listed == mint.key.to_bytes())
+                .ok_or(CurveError::BadMarketInfo)?;
+            let vault = Pubkey::new_from_array(info.vaults[index]);
             require!(
                 !self.excluded.contains(&vault),
                 CurveError::SeedNotDelivered
@@ -1551,22 +1598,35 @@ impl<'info> NewVaults<'_, 'info> {
                 .ok_or(CurveError::SeedNotDelivered)?;
             let account = &self.seed_accounts[position];
             require_keys_eq!(*account.owner, token_program, CurveError::SeedNotDelivered);
-            let balance = {
+            let (balance, authority) = {
                 let data = account.try_borrow_data()?;
                 require!(
                     data.len() >= 72 && data[..32] == mint.key.to_bytes(),
                     CurveError::SeedNotDelivered
                 );
-                u64::from_le_bytes(data[64..72].try_into().unwrap())
+                (
+                    u64::from_le_bytes(data[64..72].try_into().unwrap()),
+                    Pubkey::new_from_array(data[32..64].try_into().unwrap()),
+                )
             };
+            require!(!authority.is_on_curve(), CurveError::VaultOwnedByWallet);
             let received = balance
                 .checked_sub(self.balances_before[position])
                 .ok_or(CurveError::SeedNotDelivered)?;
-            let fee = transfer_fee(mint, taken, epoch)?;
-            require!(received >= taken - fee, CurveError::SeedNotDelivered);
-            vaults[i] = vault;
+            // Fees harvested out of the vault during seeding only count for less.
+            let withheld =
+                withheld_fees_or_zero(account).saturating_sub(self.withheld_before[position]);
+            let fees = withheld.min(transfer_fee_allowance(mint, required, epoch)?);
+            require!(
+                received.saturating_add(fees) >= required,
+                CurveError::SeedNotDelivered
+            );
+            found[i] = MarketSide {
+                index: index as u8,
+                vault,
+            };
         }
-        Ok(vaults)
+        Ok(found)
     }
 }
 
@@ -1750,9 +1810,12 @@ fn token_balance_or_zero(account: &AccountInfo) -> u64 {
     }
 }
 
-/// The Token-2022 transfer fee on one transfer of `amount` of `mint` in `epoch`: 0 for
-/// SPL Token mints and mints without a transfer fee.
-fn transfer_fee(mint: &AccountInfo, amount: u64, epoch: u64) -> Result<u64> {
+/// The most Token-2022 transfer fees a seeded vault may count towards `amount` of `mint`
+/// in `epoch`: the rate in force without its `maximum_fee` cap, rounded up, plus one unit
+/// (two transfers round up at most one unit more than one). Uncapped, so a target that
+/// moves one side in several capped transfers isn't refused. 0 for SPL Token mints and
+/// mints without a transfer fee.
+fn transfer_fee_allowance(mint: &AccountInfo, amount: u64, epoch: u64) -> Result<u64> {
     if *mint.owner != spl_token_2022::ID {
         return Ok(0);
     }
@@ -1761,9 +1824,45 @@ fn transfer_fee(mint: &AccountInfo, amount: u64, epoch: u64) -> Result<u64> {
     let Ok(config) = state.get_extension::<TransferFeeConfig>() else {
         return Ok(0);
     };
-    config
-        .calculate_epoch_fee(epoch, amount)
-        .ok_or_else(|| error!(CurveError::SeedNotDelivered))
+    let bps = u16::from(config.get_epoch_fee(epoch).transfer_fee_basis_points);
+    if bps == 0 {
+        return Ok(0);
+    }
+    let fee = (amount as u128 * bps as u128).div_ceil(10_000);
+    Ok(u64::try_from(fee + 1).unwrap_or(u64::MAX))
+}
+
+/// The transfer fees withheld in `account` if it is a Token-2022 token account with a
+/// transfer fee amount; otherwise 0.
+fn withheld_fees_or_zero(account: &AccountInfo) -> u64 {
+    if *account.owner != spl_token_2022::ID {
+        return 0;
+    }
+    let Ok(data) = account.try_borrow_data() else {
+        return 0;
+    };
+    let Ok(state) = StateWithExtensions::<spl_token_2022::state::Account>::unpack(&data) else {
+        return 0;
+    };
+    state
+        .get_extension::<TransferFeeAmount>()
+        .map_or(0, |amount| u64::from(amount.withheld_amount))
+}
+
+/// The mint of `account` if it is a token account of either token program (not a mint or
+/// a multisig); otherwise `None`.
+fn token_account_mint(account: &AccountInfo) -> Option<Pubkey> {
+    if *account.owner != anchor_spl::token::ID && *account.owner != spl_token_2022::ID {
+        return None;
+    }
+    // 165 bytes for a plain account; a Token-2022 account with extensions is longer and
+    // says it is an account (type 2) right after the base layout.
+    const BASE_LEN: usize = 165;
+    const ACCOUNT_TYPE: u8 = 2;
+    let data = account.try_borrow_data().ok()?;
+    let is_account =
+        data.len() == BASE_LEN || (data.len() > BASE_LEN && data[BASE_LEN] == ACCOUNT_TYPE);
+    is_account.then(|| Pubkey::new_from_array(data[..32].try_into().unwrap()))
 }
 
 fn mint_decimals(mint: &AccountInfo) -> Result<u8> {
@@ -2077,14 +2176,16 @@ pub enum CurveError {
     BadQuote,
     #[msg("The new pool's price is outside the curve's price tolerance")]
     PoolOffPrice,
-    #[msg("The target's market info for the new market is unreadable or doesn't list the token and quote mints first, in that order")]
+    #[msg("The target's market info for the new market is unreadable or doesn't list the token and quote mints")]
     BadMarketInfo,
     #[msg(
         "The vaults the new market declares did not receive what the target took from the escrows"
     )]
     SeedNotDelivered,
-    #[msg("A price-check quote's input vault is not the new market's vault for its input mint")]
+    #[msg("A price-check quote names a token account of the token or quote mint other than the new market's declared vault for it")]
     WrongQuoteVault,
     #[msg("A custom fallback must be a deployed program registered with Pipeline, passed after the setup accounts")]
     FallbackNotUsable,
+    #[msg("A vault the new market declares is owned by a wallet, not a program address")]
+    VaultOwnedByWallet,
 }
