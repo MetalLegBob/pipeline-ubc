@@ -7,6 +7,10 @@
 //! the AMM the creator chose, through the target's `pipeline_seed_liquidity`, at the
 //! curve's final price.
 //!
+//! If the curve hasn't graduated 3 days after completing, or hasn't completed by its
+//! optional deadline, it refunds instead: holders return their tokens with `redeem` and
+//! all receive the same share of the quote raised, at the average price paid.
+//!
 //! Two launch modes:
 //! - **New mint:** setup creates a Token-2022 mint with built-in metadata from a fresh
 //!   keypair, mints the whole supply into the curve and removes the mint authority. The
@@ -16,10 +20,13 @@
 //!   deposits the supply. Leftover tokens at graduation are claimed with
 //!   `claim_leftover`.
 //!
+//! The creator allocation stays in the curve until graduation, and is forfeited if the
+//! curve refunds.
+//!
 //! The quote vault holds the quote raised plus two fee buckets: the creator's curve fee
-//! and the optional anti-sniper launch fee, which goes into the graduated pool. The
-//! token vault holds unsold curve tokens, the graduation reserve and any unclaimed
-//! creator allocation. Pricing is in `pipeline-curve-math`, shared by quote and swap.
+//! and the optional anti-sniper launch fee, which goes into the graduated pool (or the
+//! refunds). The token vault holds unsold curve tokens, the pool's tokens and any
+//! unclaimed creator allocation. Pricing is in `pipeline-curve-math`, shared by quote and swap.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
@@ -57,12 +64,9 @@ pub const MAX_LAUNCH_FEE_BPS: u16 = 9_000;
 /// The graduation reward is a keeper tip, so like other keeper tips it is at most 1% (of
 /// the graduation threshold).
 pub const MAX_GRADUATION_REWARD_BPS: u16 = 100;
-/// After completion, graduation into the fallback target is allowed once this long has
-/// passed without a successful graduation.
-pub const FALLBACK_DELAY_SECONDS: i64 = 3 * 24 * 60 * 60;
-/// The playground constant-product strategy, the fallback when the creator names none.
-pub const DEFAULT_FALLBACK_PROGRAM: Pubkey =
-    Pubkey::from_str_const("yRptCdde1du1JYR2DcNFtLC1fkp5Asd6rE3XSvZoUFx");
+/// A complete curve may graduate until this long after completion. From then on it
+/// refunds instead.
+pub const GRADUATION_WINDOW_SECONDS: i64 = 3 * 24 * 60 * 60;
 pub const INCINERATOR: Pubkey =
     Pubkey::from_str_const("1nc1nerator11111111111111111111111111111111");
 /// Room for a graduation target's setup data (larger AMMs' parameters take about 100
@@ -75,10 +79,11 @@ pub const MAX_SYMBOL: usize = 10;
 pub const MAX_URI: usize = 128;
 /// A price tolerance of 100% turns graduation's price check off.
 pub const MAX_PRICE_TOLERANCE_BPS: u16 = 10_000;
-/// The curve account's discriminator, `sha256("account:CurveV1_1")[..8]`. Version 1 curve
-/// accounts carry Anchor's default `sha256("account:Curve")[..8]`; their layout differs,
-/// so they must never decode as version 1.1 curves.
-pub const CURVE_DISCRIMINATOR: &[u8; 8] = &[110, 95, 50, 237, 17, 202, 154, 100];
+/// The curve account's discriminator, `sha256("account:CurveV1_2")[..8]`. Earlier curve
+/// accounts carry `sha256("account:Curve")[..8]` (version 1) or
+/// `sha256("account:CurveV1_1")[..8]`; their layouts differ, so they must never decode as
+/// version 1.2 curves.
+pub const CURVE_DISCRIMINATOR: &[u8; 8] = &[237, 63, 3, 29, 31, 105, 73, 35];
 
 const BPS: u64 = 10_000;
 const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("11111111111111111111111111111111");
@@ -88,8 +93,7 @@ pub mod bonding_curve {
     use super::*;
 
     /// Called by the Pipeline router from `create_market`. `data` is a Borsh-encoded
-    /// [`InitParams`]. With a custom fallback, its program and its router registration
-    /// (`["strategy", fallback]`) follow the setup accounts.
+    /// [`InitParams`].
     pub fn pipeline_init_market<'info>(
         ctx: Context<'info, InitMarket<'info>>,
         data: Vec<u8>,
@@ -120,7 +124,6 @@ pub mod bonding_curve {
             params.total_supply,
             params.sold_bps,
             params.pool_bps,
-            params.reserve_bps,
             params.graduation_threshold,
         )
         .map_err(|_| CurveError::BadSplit)?;
@@ -147,21 +150,6 @@ pub mod bonding_curve {
                 shape.graduation_tokens + shape.leftover,
             )
             .ok_or(CurveError::BadSplit)?;
-
-        // A custom fallback is the escape when the target fails, so it must already be
-        // usable: deployed and registered with the router, as `graduate` requires. Its
-        // program and registration follow the setup accounts. (Its upgrade authority can
-        // still break it later; that is the creator's choice of fallback.)
-        if let Some(fallback) = params
-            .fallback_program
-            .filter(|program| *program != DEFAULT_FALLBACK_PROGRAM)
-        {
-            let [program, registration, ..] = ctx.remaining_accounts else {
-                return err!(CurveError::FallbackNotUsable);
-            };
-            require_registered_strategy(&fallback, program, registration)
-                .map_err(|_| CurveError::FallbackNotUsable)?;
-        }
 
         // The curve account.
         let bump_seed = [bump];
@@ -245,7 +233,8 @@ pub mod bonding_curve {
             ))?;
         }
 
-        let slot = Clock::get()?.slot;
+        let clock = Clock::get()?;
+        let slot = clock.slot;
         let status = if new_mint {
             token_interface::mint_to(
                 CpiContext::new_with_signer(
@@ -292,7 +281,6 @@ pub mod bonding_curve {
             virtual_tokens: shape.virtual_tokens,
             curve_tokens: shape.curve_tokens,
             graduation_tokens: shape.graduation_tokens,
-            reserve_tokens: shape.reserve_tokens,
             threshold: params.graduation_threshold,
             sold: 0,
             raised: 0,
@@ -312,10 +300,11 @@ pub mod bonding_curve {
             trading_delay_slots: params.trading_delay_slots,
             start_slot: slot,
             trading_opens_slot: slot.saturating_add(params.trading_delay_slots),
+            // An existing-mint curve opens when it is funded.
+            opened_at: if new_mint { clock.unix_timestamp } else { 0 },
+            deadline_seconds: params.deadline_seconds,
             target_program: params.target_program,
             target_seed_data: params.target_seed_data.clone(),
-            fallback_program: params.fallback_program.unwrap_or(DEFAULT_FALLBACK_PROGRAM),
-            fallback_seed_data: params.fallback_seed_data.clone(),
             lp_recipient: match params.lp_policy {
                 LpPolicy::Locked => lp_lock_address(&curve_key_for_lp),
                 LpPolicy::Burn => INCINERATOR,
@@ -332,6 +321,9 @@ pub mod bonding_curve {
             graduated_at: 0,
             graduated_program: Pubkey::default(),
             graduated_market_state: Pubkey::default(),
+            refund_quote: 0,
+            refund_tokens: 0,
+            redeemed: 0,
             bump,
         };
         let curve_info = accounts.curve.to_account_info();
@@ -370,10 +362,8 @@ pub mod bonding_curve {
     }
 
     pub fn pipeline_quote(ctx: Context<ReadTrade>, request: psi::TradeRequest) -> Result<()> {
-        let fill = ctx
-            .accounts
-            .curve
-            .fill(&request, request.amount, Clock::get()?.slot)?;
+        let clock = Clock::get()?;
+        let fill = ctx.accounts.curve.fill(&request, request.amount, &clock)?;
         let quote = psi::QuoteResult {
             amount_in: fill.amount_in,
             amount_out: fill.amount_out,
@@ -424,7 +414,7 @@ pub mod bonding_curve {
             TradeMode::ExactIn => received,
             TradeMode::ExactOut => trade.amount,
         };
-        let fill = curve.fill(trade, amount, clock.slot)?;
+        let fill = curve.fill(trade, amount, &clock)?;
         require!(fill.amount_in <= received, CurveError::InsufficientInput);
         let refund = received - fill.amount_in;
         let launch_bps = curve.launch_fee_now(clock.slot);
@@ -498,13 +488,14 @@ pub mod bonding_curve {
             &[],
         )?;
         let balance = token_balance(&ctx.accounts.token_vault)?;
-        let slot = Clock::get()?.slot;
+        let clock = Clock::get()?;
         let curve = &mut ctx.accounts.curve;
         curve.token_reserve = balance;
         if balance >= curve.total_supply {
             curve.status = Status::Trading;
-            curve.start_slot = slot;
-            curve.trading_opens_slot = slot.saturating_add(curve.trading_delay_slots);
+            curve.start_slot = clock.slot;
+            curve.trading_opens_slot = clock.slot.saturating_add(curve.trading_delay_slots);
+            curve.opened_at = clock.unix_timestamp;
         }
         Ok(())
     }
@@ -542,8 +533,9 @@ pub mod bonding_curve {
     }
 
     /// Custom action: the allocation owner claims the creator allocation unlocked so far.
-    /// Without vesting it is claimable at once; with vesting it unlocks linearly from
-    /// graduation. Remaining accounts are transfer-hook accounts.
+    /// Nothing unlocks before graduation. Without vesting the whole allocation unlocks at
+    /// graduation; with vesting it unlocks linearly from graduation. Remaining accounts are
+    /// transfer-hook accounts.
     pub fn claim_allocation<'info>(ctx: Context<'info, ClaimAllocation<'info>>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let amount = ctx.accounts.curve.claimable_allocation(now);
@@ -595,9 +587,10 @@ pub mod bonding_curve {
         Ok(())
     }
 
-    /// Custom action, permissionless once the curve is complete: seeds a new market on
-    /// the target strategy with the raised quote (less creator fees and the caller's
-    /// reward, plus any launch fees) and the tokens worth that much at the final price.
+    /// Custom action, permissionless once the curve is complete and until
+    /// [`GRADUATION_WINDOW_SECONDS`] after: seeds a new market on the target strategy with
+    /// the raised quote (less creator fees and the caller's reward, plus any launch fees)
+    /// and the tokens worth that much at the final price.
     ///
     /// Only two escrows owned by `["seed", curve]` and a rent payer `["rent", curve]`
     /// funded with at most `max_rent_lamports` from the caller are exposed to the target.
@@ -606,10 +599,9 @@ pub mod bonding_curve {
     ///
     /// The target's own `pipeline_market_info` then names the new market's vaults, which
     /// must have received everything the target took from the escrows. Unless the curve's
-    /// price tolerance is 100%, or this is a graduation into the default fallback (the
-    /// playground pool), the new market must also quote a small buy and a small sell whose
-    /// mid price is within the tolerance of the price the curve offered it. Otherwise the
-    /// whole graduation reverts.
+    /// price tolerance is 100%, the new market must also quote a small buy and a small
+    /// sell whose mid price is within the tolerance of the price the curve offered it.
+    /// Otherwise the whole graduation reverts.
     ///
     /// Remaining accounts, in order:
     /// 1. the target's own seed accounts, which must include the new market's vaults,
@@ -623,7 +615,6 @@ pub mod bonding_curve {
     /// 3. `sell_quote_accounts` accounts for a sell (token in, quote out), the same way.
     pub fn graduate<'info>(
         ctx: Context<'info, Graduate<'info>>,
-        use_fallback: bool,
         max_rent_lamports: u64,
         hook_accounts: u8,
         buy_quote_accounts: u8,
@@ -633,15 +624,11 @@ pub mod bonding_curve {
         let accounts = &ctx.accounts;
         let curve = &accounts.curve;
         require!(curve.status == Status::Complete, CurveError::WrongStatus);
-        let (target, seed_data) = if use_fallback {
-            require!(
-                clock.unix_timestamp >= curve.completed_at + FALLBACK_DELAY_SECONDS,
-                CurveError::FallbackTooEarly
-            );
-            (curve.fallback_program, curve.fallback_seed_data.clone())
-        } else {
-            (curve.target_program, curve.target_seed_data.clone())
-        };
+        require!(
+            clock.unix_timestamp < curve.graduation_closes_at(),
+            CurveError::GraduationClosed
+        );
+        let target = curve.target_program;
         require_registered_strategy(
             &target,
             &accounts.target_program,
@@ -669,16 +656,8 @@ pub mod bonding_curve {
             .and_then(|q| q.checked_sub(curve.graduation_reward))
             .ok_or(CurveError::NothingToGraduate)?;
         let allocation_left = curve.allocation_total - curve.allocation_claimed;
-        // The target's reserve share is offered on top of the pool's tokens (not to the
-        // fallback, for which it stays behind as leftovers), and never prices the pool.
-        let reserve = if use_fallback {
-            0
-        } else {
-            curve.reserve_tokens
-        };
         let tokens_available = token_balance(&accounts.token_vault)?
             .checked_sub(allocation_left)
-            .and_then(|t| t.checked_sub(curve.reserve_tokens))
             .ok_or(CurveError::NothingToGraduate)?;
         let (pool_quote, pool_tokens) = curve
             .math()
@@ -746,23 +725,6 @@ pub mod bonding_curve {
             seeded[0] > 0 && seeded[1] > 0,
             CurveError::NothingToGraduate
         );
-        // The reserve share goes into the same escrow in its own transfer, so what arrived
-        // for the pool (which prices it) is measured on its own.
-        let mut reserve_seeded = 0;
-        if reserve > 0 {
-            let before = token_balance(&accounts.token_escrow)?;
-            transfer_checked(
-                &accounts.token_program,
-                &accounts.token_vault,
-                &accounts.token_mint,
-                &accounts.token_escrow,
-                &curve_info,
-                hooks,
-                reserve,
-                &[&curve_seeds[..]],
-            )?;
-            reserve_seeded = token_balance(&accounts.token_escrow)? - before;
-        }
         let token_escrow_before = token_balance(&accounts.token_escrow)?;
         let quote_escrow_before = token_balance(&accounts.quote_escrow)?;
 
@@ -797,8 +759,11 @@ pub mod bonding_curve {
         let seed_withheld_before: Vec<u64> =
             seed_accounts.iter().map(withheld_fees_or_zero).collect();
 
-        // Call the target's `pipeline_seed_liquidity`.
-        let mut metas = vec![
+        // Call the target's `pipeline_seed_liquidity`. The account lists are sized once:
+        // the heap is a bump allocator that never frees, so a list that grows leaves each
+        // smaller copy behind.
+        let mut metas = Vec::with_capacity(11 + seed_accounts.len());
+        metas.extend([
             AccountMeta::new_readonly(accounts.seed_authority.key(), true),
             AccountMeta::new(accounts.new_market_state.key(), false),
             AccountMeta::new(accounts.rent_payer.key(), true),
@@ -810,8 +775,9 @@ pub mod bonding_curve {
             AccountMeta::new_readonly(accounts.quote_mint.key(), false),
             AccountMeta::new(accounts.quote_escrow.key(), false),
             AccountMeta::new_readonly(accounts.quote_token_program.key(), false),
-        ];
-        let mut infos = vec![
+        ]);
+        let mut infos = Vec::with_capacity(12 + seed_accounts.len());
+        infos.extend([
             accounts.seed_authority.to_account_info(),
             accounts.new_market_state.to_account_info(),
             accounts.rent_payer.to_account_info(),
@@ -823,7 +789,7 @@ pub mod bonding_curve {
             accounts.quote_mint.to_account_info(),
             accounts.quote_escrow.to_account_info(),
             accounts.quote_token_program.to_account_info(),
-        ];
+        ]);
         for account in seed_accounts {
             metas.push(if account.is_writable {
                 AccountMeta::new(account.key(), false)
@@ -833,17 +799,11 @@ pub mod bonding_curve {
             infos.push(account.clone());
         }
         infos.push(accounts.target_program.to_account_info());
-        // The target is offered the pool's tokens and the reserve's together; its own
-        // seed data says how many are for its reserve.
-        let request = psi::SeedRequest {
-            amounts: vec![seeded[0] + reserve_seeded, seeded[1]],
-            data: seed_data,
-        };
         invoke_signed(
             &Instruction {
                 program_id: target,
                 accounts: metas,
-                data: psi::instruction_data(psi::discriminator::SEED_LIQUIDITY, &request),
+                data: seed_request_data(seeded, &curve.target_seed_data),
             },
             &infos,
             &[seed_signer, rent_signer],
@@ -871,11 +831,9 @@ pub mod bonding_curve {
 
         // The accounts after the per-mint ones are the caller's choice, not the creator's.
         // Bind the seed to the market: the vaults the target itself declares for the new
-        // market must be owned by a program address and have received the pool's part of
-        // what it took, so a caller can't have a target that fills whichever accounts it
-        // is given send the pool elsewhere. Only the pool's tokens are bound: a
-        // reserve-aware target may keep the reserve share wherever its design does, and
-        // that account is the target's to check.
+        // market must be owned by a program address and have received what it took, so a
+        // caller can't have a target that fills whichever accounts it is given send the
+        // pool elsewhere.
         let new_sides = NewVaults {
             target: &accounts.target_program,
             market_state: &accounts.new_market_state,
@@ -904,15 +862,9 @@ pub mod bonding_curve {
         // The new market must quote the price it was offered. The probes are 0.1% of each
         // side and the market's own quotes decide, so this shows the market quotes the
         // offered mid price within the tolerance; it doesn't show the market's depth, its
-        // spread or that it holds what it was offered (a target that adds the reserve
-        // share to its pool is refused only if that moves its price beyond the tolerance).
-        //
-        // Skipped for the default fallback: the playground pool is code the curve already
-        // relies on, and checking it could leave a completed curve with no way to graduate
-        // (a pool too small for the probes' rounding, or a transfer fee above the
-        // tolerance). Custom targets and custom fallbacks are always checked.
-        let default_fallback = use_fallback && target == DEFAULT_FALLBACK_PROGRAM;
-        if curve.price_tolerance_bps < MAX_PRICE_TOLERANCE_BPS && !default_fallback {
+        // spread or that it holds what it was offered. A curve whose target can't pass it
+        // refunds once the graduation window closes.
+        if curve.price_tolerance_bps < MAX_PRICE_TOLERANCE_BPS {
             let new_market = NewMarket {
                 target: &accounts.target_program,
                 market_signer: pipeline_market_signer_for(
@@ -1048,6 +1000,79 @@ pub mod bonding_curve {
         curve.graduated_market_state = new_market_state;
         Ok(())
     }
+
+    /// Custom action, for any holder once the curve refunds: returns `amount` tokens to
+    /// the curve for the same share of the refund pool per token as every other holder.
+    ///
+    /// Refunds open when a complete curve hasn't graduated within
+    /// [`GRADUATION_WINDOW_SECONDS`], or when a curve with a deadline hasn't completed by
+    /// it. The first `redeem` fixes the rate for good: the quote vault less the creator's
+    /// unclaimed curve fees (so the raise, launch fees and any donations), over the tokens
+    /// the curve sold. Each `redeem` pays `floor(received × pool / sold)` for the tokens
+    /// that actually arrive, so redemptions in any order and size never pay out more than
+    /// the pool. Redeemed tokens stay in the curve for good, like its unsold tokens and
+    /// the forfeited allocation. Remaining accounts are transfer-hook accounts, used for
+    /// both transfers.
+    pub fn redeem<'info>(ctx: Context<'info, Redeem<'info>>, amount: u64) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let accounts = &ctx.accounts;
+        let curve = &accounts.curve;
+        require!(curve.refunds_open(now), CurveError::RefundsNotOpen);
+        let (refund_quote, refund_tokens) = if curve.status == Status::Refunding {
+            (curve.refund_quote, curve.refund_tokens)
+        } else {
+            // The creator's curve fees are always covered by the vault, so this never
+            // saturates; they stay claimable by the fee recipient.
+            let pool = token_balance(&accounts.quote_vault)?.saturating_sub(curve.creator_fees);
+            (pool, curve.sold)
+        };
+
+        // Measured, because tokens with a transfer fee arrive short.
+        let token_before = token_balance(&accounts.token_vault)?;
+        transfer_checked(
+            &accounts.token_program,
+            &accounts.holder_token,
+            &accounts.token_mint,
+            &accounts.token_vault,
+            &accounts.holder.to_account_info(),
+            ctx.remaining_accounts,
+            amount,
+            &[],
+        )?;
+        let received = token_balance(&accounts.token_vault)? - token_before;
+        let redeemed = curve
+            .redeemed
+            .checked_add(received)
+            .filter(|total| *total <= refund_tokens)
+            .ok_or(CurveError::RedemptionsExceedSold)?;
+        let payout = math::refund_payout(received, refund_quote, refund_tokens)
+            .filter(|payout| *payout > 0)
+            .ok_or(CurveError::NothingToRedeem)?;
+
+        let bump = [curve.bump];
+        let seeds = curve.signer_seeds(&bump);
+        transfer_checked(
+            &accounts.quote_token_program,
+            &accounts.quote_vault,
+            &accounts.quote_mint,
+            &accounts.destination,
+            &curve.to_account_info(),
+            ctx.remaining_accounts,
+            payout,
+            &[&seeds[..]],
+        )?;
+
+        let token_balance_after = token_balance(&accounts.token_vault)?;
+        let quote_balance_after = token_balance(&accounts.quote_vault)?;
+        let curve = &mut ctx.accounts.curve;
+        curve.status = Status::Refunding;
+        curve.refund_quote = refund_quote;
+        curve.refund_tokens = refund_tokens;
+        curve.redeemed = redeemed;
+        curve.token_reserve = token_balance_after;
+        curve.quote_reserve = quote_balance_after;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1090,22 +1115,19 @@ pub struct InitParams {
     /// Share of `total_supply` sold on the curve.
     pub sold_bps: u16,
     /// Share of `total_supply` seeded into the graduated pool. It must be smaller than
-    /// the sold share.
+    /// the sold share. Whatever is left after the two shares is the creator allocation.
     pub pool_bps: u16,
-    /// Share of `total_supply` handed to the graduation target on top of the pool's
-    /// tokens, for AMMs that keep a separate token reserve. It doesn't enter the curve's
-    /// prices. Whatever is left after the three shares is the creator allocation.
-    pub reserve_bps: u16,
     /// Quote to raise (after fees) before the curve completes. With the split, it sets
     /// the starting price and how steep the curve is.
     pub graduation_threshold: u64,
     /// The creator's fee on every curve trade, in the quote token.
     pub curve_fee_bps: u16,
     pub fee_recipient: Pubkey,
-    /// Owner of the creator allocation (the supply neither sold nor seeded).
+    /// Owner of the creator allocation (the supply neither sold nor seeded). Nothing is
+    /// claimable before graduation, and the allocation is forfeited if the curve refunds.
     pub allocation_owner: Pubkey,
-    /// 0 makes the allocation claimable at once; otherwise it unlocks linearly over this
-    /// long from graduation.
+    /// 0 unlocks the whole allocation at graduation; otherwise it unlocks linearly over
+    /// this long from graduation.
     pub vest_seconds: i64,
     /// Optional anti-sniper fee: starts at `launch_fee_bps` and falls to 0 over
     /// `launch_fee_slots`. Proceeds go into the graduated pool.
@@ -1113,13 +1135,14 @@ pub struct InitParams {
     pub launch_fee_slots: u64,
     /// Slots after opening before the first trade.
     pub trading_delay_slots: u64,
-    /// Registered strategy to graduate into, and its `pipeline_seed_liquidity` data.
+    /// 0 for none. Otherwise, if the curve hasn't completed this many seconds after it
+    /// opened (at setup, or when an existing-mint curve is funded), trading stops and it
+    /// refunds.
+    pub deadline_seconds: i64,
+    /// Registered strategy to graduate into, and its `pipeline_seed_liquidity` data. If
+    /// graduation hasn't happened 3 days after completion, the curve refunds.
     pub target_program: Pubkey,
     pub target_seed_data: Vec<u8>,
-    /// Used if graduation into the target hasn't happened 3 days after completion.
-    /// `None` means the playground constant-product strategy.
-    pub fallback_program: Option<Pubkey>,
-    pub fallback_seed_data: Vec<u8>,
     pub lp_policy: LpPolicy,
     /// Paid in the quote token to whoever runs `graduate`. At most 1% of
     /// `graduation_threshold`.
@@ -1139,23 +1162,17 @@ impl InitParams {
             self.launch_fee_bps <= MAX_LAUNCH_FEE_BPS,
             CurveError::BadInitData
         );
-        require!(self.vest_seconds >= 0, CurveError::BadInitData);
+        require!(
+            self.vest_seconds >= 0 && self.deadline_seconds >= 0,
+            CurveError::BadInitData
+        );
         // A tolerance of 0 never passes: the probes' outputs are rounded down.
         require!(
             self.price_tolerance_bps > 0 && self.price_tolerance_bps <= MAX_PRICE_TOLERANCE_BPS,
             CurveError::BadInitData
         );
-        // The default fallback is the playground pool, whose seed data is a 2-byte fee
-        // below 100%. Checked now so a curve can't be left with an unusable fallback.
-        if self.fallback_program.unwrap_or(DEFAULT_FALLBACK_PROGRAM) == DEFAULT_FALLBACK_PROGRAM {
-            let fee = <[u8; 2]>::try_from(self.fallback_seed_data.as_slice())
-                .map(u16::from_le_bytes)
-                .map_err(|_| CurveError::BadInitData)?;
-            require!((fee as u64) < BPS, CurveError::BadInitData);
-        }
         require!(
-            self.target_seed_data.len() <= MAX_SEED_DATA
-                && self.fallback_seed_data.len() <= MAX_SEED_DATA,
+            self.target_seed_data.len() <= MAX_SEED_DATA,
             CurveError::BadInitData
         );
         require!(
@@ -1184,9 +1201,13 @@ pub enum Status {
     /// The threshold is reached; waiting for `graduate`.
     Complete,
     Graduated,
+    /// Graduation's window closed, or the deadline passed before completion: holders
+    /// `redeem`. Set by the first `redeem`; until then the curve keeps its earlier status
+    /// but refunds are already open.
+    Refunding,
 }
 
-/// Version 1.1's layout, under its own discriminator (see [`CURVE_DISCRIMINATOR`]). A
+/// Version 1.2's layout, under its own discriminator (see [`CURVE_DISCRIMINATOR`]). A
 /// later layout change should append fields or change the discriminator again.
 #[account(discriminator = CURVE_DISCRIMINATOR)]
 #[derive(InitSpace)]
@@ -1207,9 +1228,6 @@ pub struct Curve {
     pub virtual_tokens: u64,
     pub curve_tokens: u64,
     pub graduation_tokens: u64,
-    /// Tokens handed to the target on top of the pool's, for its separate reserve. Not
-    /// offered to the fallback target; then they are leftovers.
-    pub reserve_tokens: u64,
     pub threshold: u64,
     pub sold: u64,
     pub raised: u64,
@@ -1231,12 +1249,13 @@ pub struct Curve {
     pub trading_delay_slots: u64,
     pub start_slot: u64,
     pub trading_opens_slot: u64,
+    /// When the curve opened, as a Unix timestamp (0 until an existing-mint curve is
+    /// funded). The deadline counts from here.
+    pub opened_at: i64,
+    pub deadline_seconds: i64,
     pub target_program: Pubkey,
     #[max_len(MAX_SEED_DATA)]
     pub target_seed_data: Vec<u8>,
-    pub fallback_program: Pubkey,
-    #[max_len(MAX_SEED_DATA)]
-    pub fallback_seed_data: Vec<u8>,
     pub lp_recipient: Pubkey,
     pub leftover_recipient: Pubkey,
     /// Existing-mint launches: tokens left over at graduation, claimable by the
@@ -1248,6 +1267,11 @@ pub struct Curve {
     pub graduated_at: i64,
     pub graduated_program: Pubkey,
     pub graduated_market_state: Pubkey,
+    /// Refunds: the quote shared out and the tokens it is shared between, fixed by the
+    /// first `redeem`, and the tokens redeemed so far.
+    pub refund_quote: u64,
+    pub refund_tokens: u64,
+    pub redeemed: u64,
     pub bump: u8,
 }
 
@@ -1292,10 +1316,40 @@ impl Curve {
         )
     }
 
+    /// When trading stops if the curve hasn't completed, if it has a deadline.
+    fn deadline(&self) -> Option<i64> {
+        (self.deadline_seconds > 0).then(|| self.opened_at.saturating_add(self.deadline_seconds))
+    }
+
+    fn past_deadline(&self, now: i64) -> bool {
+        self.deadline().is_some_and(|deadline| now >= deadline)
+    }
+
+    /// The first moment a complete curve can no longer graduate.
+    fn graduation_closes_at(&self) -> i64 {
+        self.completed_at.saturating_add(GRADUATION_WINDOW_SECONDS)
+    }
+
+    /// Whether holders may `redeem` now: the curve already refunds, a complete curve's
+    /// graduation window has closed, or a trading curve's deadline has passed.
+    fn refunds_open(&self, now: i64) -> bool {
+        match self.status {
+            Status::Refunding => true,
+            Status::Complete => now >= self.graduation_closes_at(),
+            Status::Trading => self.past_deadline(now),
+            Status::AwaitingFunds | Status::Graduated => false,
+        }
+    }
+
     /// The single pricing function behind both `pipeline_quote` and `pipeline_swap`.
-    fn fill(&self, trade: &psi::TradeRequest, amount: u64, slot: u64) -> Result<math::Fill> {
+    fn fill(&self, trade: &psi::TradeRequest, amount: u64, clock: &Clock) -> Result<math::Fill> {
         self.vaults(trade)?;
         require!(self.status == Status::Trading, CurveError::WrongStatus);
+        require!(
+            !self.past_deadline(clock.unix_timestamp),
+            CurveError::TradingClosed
+        );
+        let slot = clock.slot;
         require!(slot >= self.trading_opens_slot, CurveError::NotOpenYet);
         let fee_bps = self.curve_fee_bps + self.launch_fee_now(slot);
         let curve = self.math();
@@ -1308,14 +1362,13 @@ impl Curve {
         fill.ok_or(error!(CurveError::CannotFill))
     }
 
+    /// Nothing before graduation (and so nothing if the curve refunds); then all of it, or
+    /// linearly over the vesting period.
     fn claimable_allocation(&self, now: i64) -> u64 {
-        // An existing-mint curve holds the allocation only once it's funded.
-        let unlocked = if self.status == Status::AwaitingFunds {
+        let unlocked = if self.status != Status::Graduated {
             0
         } else if self.vest_seconds == 0 {
             self.allocation_total
-        } else if self.status != Status::Graduated {
-            0
         } else {
             let elapsed = (now - self.graduated_at).clamp(0, self.vest_seconds);
             (self.allocation_total as u128 * elapsed as u128 / self.vest_seconds as u128) as u64
@@ -1488,7 +1541,8 @@ impl<'info> NewMarket<'_, 'info> {
             .iter()
             .map(|account| AccountMeta::new_readonly(account.key(), false))
             .collect();
-        let mut infos = accounts.to_vec();
+        let mut infos = Vec::with_capacity(accounts.len() + 1);
+        infos.extend_from_slice(accounts);
         infos.push(self.target.clone());
         // Clear the target's seed result, so a quote that sets no return data can't be
         // read as one.
@@ -1791,6 +1845,21 @@ fn borsh_encode<T: AnchorSerialize>(value: &T) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
+/// `pipeline_seed_liquidity`'s instruction data for a [`psi::SeedRequest`] of `amounts`
+/// (token, then quote) and `data`, encoded straight from the curve's seed data rather than
+/// from a copy of it.
+fn seed_request_data(amounts: [u64; 2], data: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(8 + 4 + 16 + 4 + data.len());
+    encoded.extend_from_slice(&psi::discriminator::SEED_LIQUIDITY);
+    encoded.extend_from_slice(&(amounts.len() as u32).to_le_bytes());
+    for amount in amounts {
+        encoded.extend_from_slice(&amount.to_le_bytes());
+    }
+    encoded.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(data);
+    encoded
+}
+
 fn token_balance(account: &AccountInfo) -> Result<u64> {
     let data = account.try_borrow_data()?;
     require!(data.len() >= 72, CurveError::WrongAccount);
@@ -1884,16 +1953,20 @@ fn transfer_checked<'info>(
     signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
     let decimals = mint_decimals(mint)?;
-    let mut data = vec![12u8];
+    let mut data = Vec::with_capacity(10);
+    data.push(12u8);
     data.extend_from_slice(&amount.to_le_bytes());
     data.push(decimals);
-    let mut metas = vec![
+    // Sized once, as the heap never frees a list that grows.
+    let mut metas = Vec::with_capacity(4 + hook_accounts.len());
+    metas.extend([
         AccountMeta::new(from.key(), false),
         AccountMeta::new_readonly(mint.key(), false),
         AccountMeta::new(to.key(), false),
         AccountMeta::new_readonly(authority.key(), true),
-    ];
-    let mut infos = vec![from.clone(), mint.clone(), to.clone(), authority.clone()];
+    ]);
+    let mut infos = Vec::with_capacity(5 + hook_accounts.len());
+    infos.extend([from.clone(), mint.clone(), to.clone(), authority.clone()]);
     for account in hook_accounts {
         metas.push(if account.is_writable {
             AccountMeta::new(account.key(), false)
@@ -2090,6 +2163,40 @@ pub struct ClaimLeftover<'info> {
 }
 
 #[derive(Accounts)]
+pub struct Redeem<'info> {
+    pub holder: Signer<'info>,
+    #[account(
+        mut,
+        has_one = token_mint,
+        has_one = quote_mint,
+        has_one = token_vault,
+        has_one = quote_vault,
+        has_one = token_program,
+        constraint = curve.quote_program == quote_token_program.key() @ CurveError::WrongAccount,
+    )]
+    pub curve: Account<'info, Curve>,
+    /// CHECK: matched against the curve.
+    pub token_mint: UncheckedAccount<'info>,
+    /// CHECK: matched against the curve.
+    pub quote_mint: UncheckedAccount<'info>,
+    /// CHECK: matched against the curve.
+    #[account(mut)]
+    pub token_vault: UncheckedAccount<'info>,
+    /// CHECK: matched against the curve.
+    #[account(mut)]
+    pub quote_vault: UncheckedAccount<'info>,
+    /// CHECK: the holder's token account; the token program checks it and the holder's
+    /// signature.
+    #[account(mut)]
+    pub holder_token: UncheckedAccount<'info>,
+    /// CHECK: any token account of the quote mint; the token program checks it.
+    #[account(mut)]
+    pub destination: UncheckedAccount<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub quote_token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
 pub struct Graduate<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
@@ -2133,7 +2240,7 @@ pub struct Graduate<'info> {
     /// CHECK: any token account of the quote mint; the token program checks it.
     #[account(mut)]
     pub reward_account: UncheckedAccount<'info>,
-    /// CHECK: the curve's target or fallback; checked in the handler.
+    /// CHECK: the curve's target; checked in the handler.
     pub target_program: UncheckedAccount<'info>,
     /// CHECK: the router's registration of the target; checked in the handler.
     pub target_registration: UncheckedAccount<'info>,
@@ -2162,8 +2269,8 @@ pub enum CurveError {
     CannotFill,
     #[msg("Not enough input for the requested output")]
     InsufficientInput,
-    #[msg("The fallback target is only allowed 3 days after completion")]
-    FallbackTooEarly,
+    #[msg("Graduation closed 3 days after completion; the curve refunds instead")]
+    GraduationClosed,
     #[msg("The target strategy is not registered with Pipeline")]
     TargetNotRegistered,
     #[msg("Nothing to graduate")]
@@ -2184,8 +2291,34 @@ pub enum CurveError {
     SeedNotDelivered,
     #[msg("A price-check quote names a token account of the token or quote mint other than the new market's declared vault for it")]
     WrongQuoteVault,
-    #[msg("A custom fallback must be a deployed program registered with Pipeline, passed after the setup accounts")]
-    FallbackNotUsable,
+    #[msg("Refunds are not open: the curve is still trading without a passed deadline, within its graduation window, or graduated")]
+    RefundsNotOpen,
     #[msg("A vault the new market declares is owned by a wallet, not a program address")]
     VaultOwnedByWallet,
+    #[msg("The curve's deadline has passed: trading is closed and it refunds instead")]
+    TradingClosed,
+    #[msg("These tokens redeem for nothing")]
+    NothingToRedeem,
+    #[msg("More tokens would be redeemed than the curve sold")]
+    RedemptionsExceedSold,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_request_data_matches_the_interface_encoding() {
+        for data in [vec![], vec![7u8; 3], vec![255u8; MAX_SEED_DATA]] {
+            let amounts = [123_456_789, u64::MAX];
+            let request = psi::SeedRequest {
+                amounts: amounts.to_vec(),
+                data: data.clone(),
+            };
+            assert_eq!(
+                seed_request_data(amounts, &data),
+                psi::instruction_data(psi::discriminator::SEED_LIQUIDITY, &request)
+            );
+        }
+    }
 }

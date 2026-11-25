@@ -23,18 +23,18 @@ proptest! {
         pool_bps in bps(),
         threshold in magnitude(),
     ) {
-        let Ok(shape) = solve_split(supply, sold_bps, pool_bps, 0, threshold) else {
+        let Ok(shape) = solve_split(supply, sold_bps, pool_bps, threshold) else {
             return Ok(());
         };
         let (s, p) = (shape.curve_tokens, shape.graduation_tokens);
         prop_assert_eq!(s + p + shape.allocation + shape.leftover, supply);
-        prop_assert!(shape.leftover <= 3);
+        prop_assert!(shape.leftover <= 2);
         prop_assert!(s > p && p > 0 && shape.virtual_quote > 0);
         prop_assert!(shape.virtual_tokens > s);
 
         // At completion (everything sold, the threshold raised) the pool needs at most
-        // the pool share, and at least one unit less: the reserve covers it and the
-        // pool opens at the curve's final price.
+        // the pool share, and at least one unit less: the pool's tokens (its share plus
+        // the dust) cover it and the pool opens at the curve's final price.
         let done = Curve {
             virtual_quote: shape.virtual_quote,
             virtual_tokens: shape.virtual_tokens,
@@ -43,8 +43,8 @@ proptest! {
             sold: s,
             raised: threshold,
         };
-        let reserve = p + shape.leftover;
-        if let Some((_, tokens)) = done.graduation_amounts(threshold, reserve) {
+        let pool_tokens = p + shape.leftover;
+        if let Some((_, tokens)) = done.graduation_amounts(threshold, pool_tokens) {
             prop_assert!(tokens <= p, "needs {} of {}", tokens, p);
             prop_assert!(p - tokens <= 1, "needs {} of {}", tokens, p);
         } else {
@@ -67,7 +67,7 @@ proptest! {
         pool_bps in bps(),
         threshold in magnitude(),
     ) {
-        let Err(error) = solve_split(supply, sold_bps, pool_bps, 0, threshold) else {
+        let Err(error) = solve_split(supply, sold_bps, pool_bps, threshold) else {
             return Ok(());
         };
         let share = |bps: u16| (supply as u128 * bps as u128 / BPS as u128) as u64;
@@ -117,7 +117,7 @@ fn common_splits_all_solve() {
     ] {
         for threshold in [1u64, 1_000_000, 85_000_000_000, 10u64.pow(15)] {
             for (sold, pool) in splits {
-                let result = solve_split(supply, sold, pool, 0, threshold);
+                let result = solve_split(supply, sold, pool, threshold);
                 assert!(
                     result.is_ok(),
                     "{supply} {threshold} {sold}/{pool}: {result:?}"
@@ -151,46 +151,5 @@ proptest! {
                 && (b - t) * (b - t) * offered <= pool
                 && pool <= (b + t) * (b + t) * offered);
         prop_assert_eq!(mid_price_within(quote, tokens, &probes, tolerance), expected);
-    }
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(20_000))]
-
-    /// A reserve share for the graduation target never changes the curve: the same sold
-    /// and pool shares give the same prices with or without it. The supply still adds up
-    /// exactly, and a split is refused only when the three shares exceed 100%.
-    #[test]
-    fn a_reserve_share_leaves_the_curve_unchanged(
-        supply in magnitude(),
-        sold_bps in bps(),
-        pool_bps in bps(),
-        reserve_bps in bps(),
-        threshold in magnitude(),
-    ) {
-        let with_reserve = solve_split(supply, sold_bps, pool_bps, reserve_bps, threshold);
-        let shares = sold_bps as u64 + pool_bps as u64 + reserve_bps as u64;
-        if shares > BPS {
-            prop_assert_eq!(with_reserve, Err(SplitError::SharesAbove100Percent));
-            return Ok(());
-        }
-        let without = solve_split(supply, sold_bps, pool_bps, 0, threshold);
-        match (with_reserve, without) {
-            (Ok(a), Ok(b)) => {
-                prop_assert_eq!(a.virtual_quote, b.virtual_quote);
-                prop_assert_eq!(a.virtual_tokens, b.virtual_tokens);
-                prop_assert_eq!(a.curve_tokens, b.curve_tokens);
-                prop_assert_eq!(a.graduation_tokens, b.graduation_tokens);
-                let share = (supply as u128 * reserve_bps as u128 / BPS as u128) as u64;
-                prop_assert_eq!(a.reserve_tokens, share);
-                prop_assert_eq!(
-                    a.curve_tokens + a.graduation_tokens + a.reserve_tokens + a.allocation + a.leftover,
-                    supply
-                );
-                prop_assert!(a.leftover <= 3);
-            }
-            (Err(a), Err(b)) => prop_assert_eq!(a, b),
-            (a, b) => prop_assert!(false, "with reserve {a:?}, without {b:?}"),
-        }
     }
 }

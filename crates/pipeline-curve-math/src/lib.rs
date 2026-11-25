@@ -68,19 +68,16 @@ pub struct Shape {
     pub curve_tokens: u64,
     /// Tokens reserved for the pool at graduation (`P`).
     pub graduation_tokens: u64,
-    /// Tokens handed to the graduation target on top of the pool's, for its own separate
-    /// reserve (`reserve_bps`). They don't enter the curve's prices.
-    pub reserve_tokens: u64,
     /// The creator allocation.
     pub allocation: u64,
-    /// Rounding dust from the three shares; it joins the pool's reserve at graduation.
+    /// Rounding dust from the shares; it joins the pool's reserve at graduation.
     pub leftover: u64,
 }
 
 /// Why a split was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitError {
-    /// `sold_bps + pool_bps + reserve_bps` is more than 100%.
+    /// `sold_bps + pool_bps` is more than 100%.
     SharesAbove100Percent,
     /// The curve would sell no more tokens than the pool gets. A constant-product curve
     /// can't hand off continuously to a pool holding as much as it sold or more.
@@ -93,9 +90,8 @@ pub enum SplitError {
 
 /// Derives the curve from the creator's split: `S` tokens (`sold_bps` of
 /// `total_supply`) sold along the curve while it raises `threshold` (`T`) of quote, and
-/// `P` tokens (`pool_bps`) reserved for the graduated pool. `reserve_bps` more go to the
-/// graduation target on top of the pool's, for a separate reserve it keeps; they don't
-/// enter the prices. The rest is the creator allocation.
+/// `P` tokens (`pool_bps`) reserved for the graduated pool. The rest is the creator
+/// allocation.
 ///
 /// Continuity requires the curve's final price `(V + T) / (virtual_tokens − S)` to equal
 /// the pool's opening price `T / P`, which gives
@@ -113,20 +109,18 @@ pub fn solve_split(
     total_supply: u64,
     sold_bps: u16,
     pool_bps: u16,
-    reserve_bps: u16,
     threshold: u64,
 ) -> Result<Shape, SplitError> {
-    let shares = sold_bps as u64 + pool_bps as u64 + reserve_bps as u64;
+    let shares = sold_bps as u64 + pool_bps as u64;
     if shares > BPS {
         return Err(SplitError::SharesAbove100Percent);
     }
     let share_of = |bps: u64| (total_supply as u128 * bps as u128 / BPS as u128) as u64;
     let s = share_of(sold_bps as u64);
     let p = share_of(pool_bps as u64);
-    let reserve = share_of(reserve_bps as u64);
     let allocation = share_of(BPS - shares);
-    // Each share rounds down by less than one unit, so the dust is at most 3.
-    let leftover = total_supply - s - p - reserve - allocation;
+    // Each share rounds down by less than one unit, so the dust is at most 2.
+    let leftover = total_supply - s - p - allocation;
     if s <= p {
         return Err(SplitError::PoolNotBelowSold);
     }
@@ -149,7 +143,6 @@ pub fn solve_split(
         virtual_tokens,
         curve_tokens: s,
         graduation_tokens: p,
-        reserve_tokens: reserve,
         allocation,
         leftover,
     })
@@ -171,6 +164,19 @@ impl Shape {
         // P < 2^64 and T < 2^64, so P·T fits in 128 bits; so does 1,000·(S − P).
         self.graduation_tokens as u128 * threshold as u128 >= MIN_VIRTUAL_QUOTE as u128 * gap
     }
+}
+
+/// What a refund pays for `tokens` returned to a curve whose refund pool is `pool` quote
+/// for `sold` tokens: `floor(tokens × pool / sold)`. Every holder gets the same rate, and
+/// because each payout rounds down, payouts for any tokens adding up to at most `sold`
+/// never add up to more than `pool`. `None` if `tokens` is more than `sold` or nothing was
+/// sold.
+pub fn refund_payout(tokens: u64, pool: u64, sold: u64) -> Option<u64> {
+    if sold == 0 || tokens > sold {
+        return None;
+    }
+    // tokens ≤ sold, so the quotient is at most `pool` and fits in 64 bits.
+    Some((tokens as u128 * pool as u128 / sold as u128) as u64)
 }
 
 /// The size of each probe trade in the post-seed price check: 0.1% of what was seeded,
@@ -494,11 +500,11 @@ mod tests {
     #[test]
     fn the_minimum_virtual_quote_is_exact() {
         // S = 9e8, P = 1e8: P·T = 1,000·(S − P) at T = 8,000.
-        let at = solve_split(1_000_000_000, 9_000, 1_000, 0, 8_000).unwrap();
+        let at = solve_split(1_000_000_000, 9_000, 1_000, 8_000).unwrap();
         assert!(at.has_enough_virtual_quote(8_000));
-        let below = solve_split(1_000_000_000, 9_000, 1_000, 0, 7_999).unwrap();
+        let below = solve_split(1_000_000_000, 9_000, 1_000, 7_999).unwrap();
         assert!(!below.has_enough_virtual_quote(7_999));
-        let default = solve_split(1_000_000_000_000_000, 7_931, 2_069, 0, 85 * SOL).unwrap();
+        let default = solve_split(1_000_000_000_000_000, 7_931, 2_069, 85 * SOL).unwrap();
         assert!(default.has_enough_virtual_quote(85 * SOL));
     }
 
@@ -672,7 +678,7 @@ mod tests {
 
     #[test]
     fn the_default_split_reproduces_the_pump_fun_curve() {
-        let shape = solve_split(1_000_000_000 * TOKEN, 7_931, 2_069, 0, 85 * SOL).unwrap();
+        let shape = solve_split(1_000_000_000 * TOKEN, 7_931, 2_069, 85 * SOL).unwrap();
         assert_eq!(shape.curve_tokens, 793_100_000 * TOKEN);
         assert_eq!(shape.graduation_tokens, 206_900_000 * TOKEN);
         assert_eq!((shape.allocation, shape.leftover), (0, 0));
@@ -691,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_completed_curve_needs_at_most_the_pool_share() {
-        let shape = solve_split(1_000_000_000 * TOKEN, 4_500, 3_000, 0, 85 * SOL).unwrap();
+        let shape = solve_split(1_000_000_000 * TOKEN, 4_500, 3_000, 85 * SOL).unwrap();
         assert_eq!(shape.allocation, 250_000_000 * TOKEN);
         let done = Curve {
             virtual_quote: shape.virtual_quote,
@@ -713,7 +719,7 @@ mod tests {
     #[test]
     fn impossible_splits_are_refused() {
         let supply = 1_000_000_000 * TOKEN;
-        let refused = |sold, pool, t| solve_split(supply, sold, pool, 0, t).unwrap_err();
+        let refused = |sold, pool, t| solve_split(supply, sold, pool, t).unwrap_err();
         assert_eq!(
             refused(6_000, 4_001, SOL),
             SplitError::SharesAbove100Percent
@@ -724,14 +730,34 @@ mod tests {
         assert_eq!(refused(5_000, 1_000, 0), SplitError::Zero);
         // S − P of one unit makes V = P·T, far beyond 64 bits.
         assert_eq!(
-            solve_split(10_001, 5_000, 4_999, 0, u64::MAX).unwrap_err(),
+            solve_split(10_001, 5_000, 4_999, u64::MAX).unwrap_err(),
             SplitError::Overflow
         );
         // Shares that differ in basis points but not in tokens.
         assert_eq!(
-            solve_split(3, 5_001, 4_999, 0, SOL).unwrap_err(),
+            solve_split(3, 5_001, 4_999, SOL).unwrap_err(),
             SplitError::PoolNotBelowSold
         );
+    }
+
+    #[test]
+    fn refunds_pay_the_same_rate_and_never_more_than_the_pool() {
+        let (pool, sold) = (85 * SOL + 7, 793_100_000 * TOKEN);
+        assert_eq!(refund_payout(sold, pool, sold), Some(pool));
+        assert_eq!(refund_payout(0, pool, sold), Some(0));
+        assert_eq!(refund_payout(sold + 1, pool, sold), None);
+        assert_eq!(refund_payout(0, pool, 0), None);
+        // Redeeming in many pieces pays at most what redeeming at once does.
+        let pieces = [1, 3, 999_999, sold / 3, sold / 7];
+        let paid: u64 = pieces
+            .iter()
+            .map(|&tokens| refund_payout(tokens, pool, sold).unwrap())
+            .sum();
+        let together: u64 = pieces.iter().sum();
+        assert!(paid <= refund_payout(together, pool, sold).unwrap());
+        // The largest values fit.
+        assert_eq!(refund_payout(u64::MAX, u64::MAX, u64::MAX), Some(u64::MAX));
+        assert_eq!(refund_payout(1, u64::MAX, u64::MAX), Some(1));
     }
 
     fn probes_for_pool(quote: u64, tokens: u64, fee_bps: u64) -> Probes {

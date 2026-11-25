@@ -31,3 +31,5 @@ jobs:
         run: cargo clippy -p pipeline-curve-math --all-targets -- -D warnings
       - name: Test the pricing maths
         run: cargo test -p pipeline-curve-math
+      - name: Test the program's own unit tests
+        run: cargo test -p bonding-curve
